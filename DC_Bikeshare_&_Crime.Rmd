@@ -1,0 +1,428 @@
+While the city of Washington D.C maybe a tourist destination as well as sit for many young workers, especially in the tech field, it is also a host a number of underlying issues that may drive people away. Firstly, D.C has some of the worst traffic in the nation, ranking higher than Los Angles and New York City most year, with the average commuter waiting upwards of 67 hours in traffic annually. There however have been a number of solutions to these problem, one of them being the creation of the Capital Bikeshare Program, which offers users the ability to rent bikes in and outside the city to alleviate the need for cars. This program, which started in 2010, has been wildly successful as D.C. commute time has dropped by 9 hour annually. Additionally, D.C. is now a nationwide leader in workers commuting to work on bikes, with over 16% of the workforce doing so. However, D.C also has a history of rampant crime.In recent years, there have been roughly 1000 crimes per 100,000 people and has been nicknamed the "Murder Capital of America". While violent crimes have steadily been decreasing in recent years, there is still an abundance of property crimes and D.C still ranks very high on the nation index for crimes of all types. My research question is "Does certain crimes affect Capital Bike rider usage, and can we predict the number of users on a given day?”. I hope that by using several models and workflows I will be able to accurately predict the number of user on a given day so that I can eventually create a system that will allow for the bike share program to be able to assess  when they can take bikes in and when they would need to bring more bikes out to avoid unnecessary wear and tear on their current fleet. I used the three data sets from 2011 and 2012  below to accomplish this. 
+#Data Loading and Cleanup 
+#Data Loading and Cleanup 
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+# Importing data Via Web scrapping - Additional Part 1 
+url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/00275/Bike-Sharing-Dataset.zip"
+temp <- tempfile()
+download.file(url, temp)
+unzip(temp, "day.csv")
+bike_data <- read.csv("day.csv")
+sum(is.na(bike_data))
+crime_2011<- read.csv("Crime_Incidents_in_2011 (1).csv")
+crime_2012 <- read.csv("Crime_Incidents_in_2012.csv")
+crime_combined <- rbind(crime_2011, crime_2012)
+crime_combined<- subset(crime_combined, select = c("REPORT_DAT", "OFFENSE"))
+crime_combined$REPORT_DAT <- as.Date(crime_combined$REPORT_DAT, format = "%Y/%m/%d")
+crime_count <- crime_combined %>% group_by(REPORT_DAT, OFFENSE) %>% summarize(count = n())
+crime_count_wide <- spread(crime_count, key = OFFENSE, value = count)
+colnames(crime_count_wide)[which(names(crime_count_wide) == "REPORT_DAT")] <- "Date"
+sum(is.na(crime_count_wide))
+crime_count_wide <- replace(crime_count_wide, is.na(crime_count_wide),0)
+sum(is.na(crime_count_wide))
+crime_count_wide_cut <- slice(crime_count_wide, 1:nrow(crime_count_wide)-1)
+
+summary(crime_count_wide)
+summary(bike_data)
+colnames(bike_data)[2] <- "Date"
+bike_data$Date <- ymd(bike_data$Date)
+
+DC_Daily <- merge(bike_data, crime_count_wide, by= "Date", all.x = TRUE)
+
+
+```
+##Tidying and Exploration 
+
+```{r}
+str(DC_Daily)
+colnames(DC_Daily)
+DC_Daily$season <- factor(DC_Daily$season)
+DC_Daily$yr <- factor(DC_Daily$yr)
+DC_Daily$mnth <- factor(DC_Daily$mnth)
+DC_Daily$holiday <- factor(DC_Daily$holiday)
+DC_Daily$weekday <- factor(DC_Daily$weekday)
+DC_Daily$workingday <- factor(DC_Daily$workingday)
+DC_Daily$weathersit <- factor(DC_Daily$weathersit)
+colnames(DC_Daily)[colnames(DC_Daily) == "ARSON"] <- "Arson"
+colnames(DC_Daily)[colnames(DC_Daily) == "ASSAULT W/DANGEROUS WEAPON"] <- "Assault"
+colnames(DC_Daily)[colnames(DC_Daily) == "BURGLARY"] <- "Burglary"
+colnames(DC_Daily)[colnames(DC_Daily) == "MOTOR VEHICLE THEFT"] <- "Motor_Vehicle_Theft"
+colnames(DC_Daily)[colnames(DC_Daily) == "HOMICIDE"] <- "Homicide"
+colnames(DC_Daily)[colnames(DC_Daily) == "ROBBERY"] <- "Robbery"
+colnames(DC_Daily)[colnames(DC_Daily) == "SEX ABUSE"] <- "Sex_Abuse"
+colnames(DC_Daily)[colnames(DC_Daily) == "THEFT F/AUTO"] <- "Theft_From_Auto"
+colnames(DC_Daily)[colnames(DC_Daily) == "THEFT/OTHER"] <- "Other_Theft"
+
+int_cols <- sapply(DC_Daily, is.integer)
+DC_Daily[int_cols] <- lapply(DC_Daily[int_cols], as.numeric)
+sapply(DC_Daily, class)
+
+
+plot(DC_Daily$temp, DC_Daily$cnt, main = "Temperature vs. Bike Rentals", xlab = "Temperature", ylab = "Bike Rentals")
+boxplot(DC_Daily$cnt ~ DC_Daily$season, main = "Bike Rentals by Season", xlab = "Season", ylab = "Bike Rentals")
+hist(DC_Daily$cnt, main = "Distribution of Bike Rentals", xlab = "Bike Rentals")
+pairs(DC_Daily[, c("temp", "atemp", "hum", "windspeed", "cnt")])
+plot(DC_Daily$Robbery, DC_Daily$cnt, main = "Robbery vs. Bike Rentals", xlab = "Robberies", ylab = "Bike Rentals")
+plot(DC_Daily$Assault, DC_Daily$cnt, main = "Assault vs. Bike Rentals", xlab = "Assault", ylab = "Bike Rentals")
+plot(DC_Daily$season, DC_Daily$Homicide, main = "Seasonality of Homicides", xlab = "Season", ylab = "Homicides")
+
+
+
+```
+
+## PCA - Additional Part 2 
+
+```{r}
+my_vars <- c("temp","hum", "atemp", "windspeed","cnt","casual","registered","Arson","Assault","Homicide","Robbery") 
+DC_Daily_sub <- DC_Daily[, my_vars]
+pca<- prcomp(DC_Daily_sub, scale. = TRUE)
+summary(pca)
+```
+
+##Model Creation 
+
+
+```{r}
+library(caret)
+library(glmnet)
+library(randomForest)
+library(kknn)
+library(tidyverse)
+library(tidymodels)
+library(splines)
+library(recipes)
+
+
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Create train/test split
+trainIndex <- createDataPartition(DC_Daily$cnt, p = 0.8, list = FALSE)
+train <- DC_Daily[trainIndex, ]
+test <- DC_Daily[-trainIndex, ]
+
+#Model 1 Linear regression 
+count_lr_parsnip_1 <- linear_reg() %>% 
+  set_mode("regression") %>%
+  set_engine("lm")
+count_workflow_1 <- workflow() %>%
+  add_model(count_lr_parsnip_1) %>%
+  add_formula(cnt ~ season)
+count_fit_1 <- count_workflow_1 %>% fit(data = train)
+
+
+
+#Model 2 Ridge Regression 
+# Define the predictor variables
+predictors <- c("Arson", "Homicide","Other_Theft","Assault","Burglary","Motor_Vechicle_Theft","Robbery","Sex_Abuse","Theft_From_Auto")
+
+
+# Define the LASSO penalty
+penalty <- 0.005
+
+# Create a recipe to preprocess the data
+count_2_recipe <- recipe(cnt ~., data = train) %>%
+    step_rm(Date) %>%
+  # Normalize all numeric predictors
+  step_normalize(all_numeric_predictors()) %>%
+  # Create dummy variables for categorical predictors
+  step_dummy(all_nominal_predictors())
+# Create a workflow to train the LASSO model
+count_2_workflow <- workflow() %>%
+  # Add the recipe
+  add_recipe(count_2_recipe) %>%
+  # Add the LASSO model with glmnet engine
+  add_model(linear_reg(penalty = penalty) %>% set_engine("glmnet") %>% set_mode("regression"))
+
+# Fit the LASSO model
+count_fit_2 <- count_2_workflow %>% fit(data = train)
+
+
+#Model 3 Random Forest  
+# Define the predictor variables
+response <- "cnt"
+predictors <- setdiff(names(train), response)
+rf_recipe <- recipe(formula = as.formula(paste(response, "~ .")), data = train) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+rf_workflow <- workflow() %>%
+  # Add the recipe
+  add_recipe(rf_recipe) %>%
+  # Add the random forest model with ranger engine
+  add_model(rand_forest() %>% set_mode("regression") %>% set_engine("ranger"))
+count_fit_3 <- rf_workflow %>% fit(data = train)
+
+
+#Model 4 KNN with3 neighbors 
+
+# create the kknn model specification
+kknn_spec <- nearest_neighbor() %>% 
+  set_mode("regression") %>%
+  set_engine("kknn", neighbors = 3)
+
+# create the workflow
+kknn_wf <- workflow() %>%
+  add_model(kknn_spec) %>%
+  add_formula(cnt ~ .)
+
+# fit the model to the training data
+count_fit_4 <- kknn_wf %>% fit(train)
+
+
+
+# Model 5: KNN with 5 neighbors 
+kknn_spec_5 <- nearest_neighbor() %>% 
+  set_mode("regression") %>%
+  set_engine("kknn", neighbors = 5)
+
+# create the workflow
+kknn_wf_5 <- workflow() %>%
+  add_model(kknn_spec_5) %>%
+  add_formula(cnt ~ .)
+
+# fit the model to the training data
+count_fit_5 <- kknn_wf_5 %>% fit(train)
+
+
+```
+
+#Model Selection  
+```{r}
+truth <- test %>% pull(cnt)
+model_1_predictions <- count_fit_1 %>% 
+  predict(test) %>%
+  mutate(cnt = truth)
+model_2_predictions <- count_fit_2 %>% 
+  predict(test) %>%
+  mutate(cnt = truth)
+model_3_predictions <- count_fit_3%>% 
+  predict(test) %>%
+  mutate(cnt = truth)
+model_4_predictions <- count_fit_4%>% 
+  predict(test) %>%
+  mutate(cnt = truth)
+model_5_predictions <- count_fit_5%>% 
+  predict(test) %>%
+  mutate(cnt = truth)
+
+all_predictions <- bind_rows(
+  model_1_predictions,
+  model_2_predictions,
+  model_3_predictions,
+  model_4_predictions,
+  model_5_predictions, .id = "Model"
+) %>%
+  rename(prediction = .pred)
+
+
+all_predictions %>% ggplot(aes(x = cnt,
+                                      y = prediction)) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~Model, nrow = 2) +
+  geom_abline(slope = 1, linetype = "dotted", color = "red") +
+  coord_obs_pred()
+
+#Pretty clear from chart that Model 2 and Model 3 are the most accurate but further analysis is required 
+
+```
+
+```{r}
+count_metrics <- metric_set(yardstick::rmse, rsq, yardstick::mae)
+metric_results <- all_predictions %>%
+  group_by(Model) %>%
+  count_metrics(truth = cnt, estimate = prediction)
+
+metric_results %>% 
+  filter(.metric == "rmse") %>%
+  slice_min(.estimate)
+
+metric_results %>% 
+  filter(.metric == "mae") %>%
+  slice_min(.estimate)
+
+metric_results %>% ggplot(aes(y = Model, x = .estimate, fill = Model)) + 
+  geom_col() +
+  facet_wrap(~.metric, scales = "free_x") 
+
+```
+##Test on Additional Seeds Additional Point 3 
+```{r}
+set.seed(11)
+# Create train/test split
+trainIndex <- createDataPartition(DC_Daily$cnt, p = 0.8, list = FALSE)
+train_2 <- DC_Daily[trainIndex, ]
+test_2 <- DC_Daily[-trainIndex, ]
+
+#Model 1 Linear regression 
+count_lr_parsnip_1_2 <- linear_reg() %>% 
+  set_mode("regression") %>%
+  set_engine("lm")
+count_workflow_1_2 <- workflow() %>%
+  add_model(count_lr_parsnip_1_2) %>%
+  add_formula(cnt ~ season)
+count_fit_1_2 <- count_workflow_1_2 %>% fit(data = train_2)
+
+
+
+#Model 2 Ridge Regression 
+# Define the predictor variables
+predictors <- c("Arson", "Homicide","Other_Theft","Assault","Burglary","Motor_Vechicle_Theft","Robbery","Sex_Abuse","Theft_From_Auto")
+
+
+# Define the LASSO penalty
+penalty <- 0.005
+
+# Create a recipe to preprocess the data
+count_2_recipe_2 <- recipe(cnt ~., data = train_2) %>%
+    step_rm(Date) %>%
+  # Normalize all numeric predictors
+  step_normalize(all_numeric_predictors()) %>%
+  # Create dummy variables for categorical predictors
+  step_dummy(all_nominal_predictors())
+# Create a workflow to train the LASSO model
+count_2_workflow_2 <- workflow() %>%
+  # Add the recipe
+  add_recipe(count_2_recipe_2) %>%
+  # Add the LASSO model with glmnet engine
+  add_model(linear_reg(penalty = penalty) %>% set_engine("glmnet") %>% set_mode("regression"))
+
+# Fit the LASSO model
+count_fit_2_2 <- count_2_workflow_2 %>% fit(data = train_2)
+
+
+#Model 3 Random Forest  
+# Define the predictor variables
+response <- "cnt"
+predictors <- setdiff(names(train_2), response)
+rf_recipe_2 <- recipe(formula = as.formula(paste(response, "~ .")), data = train_2) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+rf_workflow_2 <- workflow() %>%
+  # Add the recipe
+  add_recipe(rf_recipe_2) %>%
+  # Add the random forest model with ranger engine
+  add_model(rand_forest() %>% set_mode("regression") %>% set_engine("ranger"))
+count_fit_3_2 <- rf_workflow_2 %>% fit(data = train_2)
+
+
+#Model 4 KNN with 3 neighbors 
+
+# create the kknn model specification
+kknn_spec_2 <- nearest_neighbor() %>% 
+  set_mode("regression") %>%
+  set_engine("kknn", neighbors = 3)
+
+# create the workflow
+kknn_wf_2 <- workflow() %>%
+  add_model(kknn_spec_2) %>%
+  add_formula(cnt ~ .)
+
+# fit the model to the training data
+count_fit_4_2 <- kknn_wf_2 %>% fit(train_2)
+
+
+
+# Model 5: KNN with 5 neighbors 
+kknn_spec_5_2 <- nearest_neighbor() %>% 
+  set_mode("regression") %>%
+  set_engine("kknn", neighbors = 5)
+
+# create the workflow
+kknn_wf_5_2 <- workflow() %>%
+  add_model(kknn_spec_5_2) %>%
+  add_formula(cnt ~ .)
+
+# fit the model to the training data
+count_fit_5_2 <- kknn_wf_5_2 %>% fit(train_2)
+
+
+##Model Selection 
+truth_2 <- test_2 %>% pull(cnt)
+model_1_predictions_2 <- count_fit_1_2 %>% 
+  predict(test_2) %>%
+  mutate(cnt = truth_2)
+model_2_predictions_2 <- count_fit_2_2 %>% 
+  predict(test_2) %>%
+  mutate(cnt = truth_2)
+model_3_predictions_2 <- count_fit_3_2%>% 
+  predict(test_2) %>%
+  mutate(cnt = truth_2)
+model_4_predictions_2 <- count_fit_4_2%>% 
+  predict(test_2) %>%
+  mutate(cnt = truth_2)
+model_5_predictions_2 <- count_fit_5_2%>% 
+  predict(test_2) %>%
+  mutate(cnt = truth_2)
+
+all_predictions_2 <- bind_rows(
+  model_1_predictions_2,
+  model_2_predictions_2,
+  model_3_predictions_2,
+  model_4_predictions_2,
+  model_5_predictions_2, .id = "Model"
+) %>%
+  rename(prediction = .pred)
+
+
+all_predictions_2 %>% ggplot(aes(x = cnt,
+                                      y = prediction)) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~Model, nrow = 2) +
+  geom_abline(slope = 1, linetype = "dotted", color = "red") +
+  coord_obs_pred()
+##Obtained the same results 
+
+```
+##Uncertainty Quanitifcation  
+```{r}
+
+
+##Held out Data 
+
+# Fit the model using the full training set
+all_predictions <- bind_rows(
+  model_1_predictions,
+  model_2_predictions,
+  model_3_predictions,
+  model_4_predictions,
+  model_5_predictions, .id = "Model"
+) %>%
+  rename(prediction = .pred)
+set.seed(1)
+all_predictions %>% slice_sample(n = 10) 
+
+count_metrics <- metric_set(accuracy, mcc, sensitivity, specificity)
+
+
+# all_predictions %>% 
+#   group_by(Model) %>%
+#   count_metrics(truth = truth, estimate = prediction)
+# all_predictions %>%
+#   group_by(Model) %>%
+#   roc_auc(truth = truth,
+#             `.pred)
+#There was an issue with knitting this portion 
+
+#Bayesian Posterior Distribution- Additional Point 4 
+library(brms)
+library(tidybayes)
+
+set.seed(1)
+#fit <- brm(cnt,.pred, # regression formula
+#           data = model_2_predictions,  # data to be used
+#          family = bernoulli(link = "logit")) 
+
+
+##Effective Sample size was too low for this to be accurate, I will attempt to do more iterations  to improve this but it is unlikely that I will get an appropriate posterior distribution. 
+
+
+
+```
+##Conclusion #The most accurate model taht I created was my model 2, which used Lasso Regression and a penalty of 0.005. My random forest was my secodn most accurate. I was able to obtain an accurary of .78 with my model 2, which I consider to be reasonable. In further exploration of teh data, I would like to incorporate both more hourly data as well as location data, such as the ward or station in the D.C Area as well as traffic concentrations. I would also like to expand the years to 2010 to 2023 as the program has shown to be sucessful and Crime rates have fallen in recent years.
+
+
